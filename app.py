@@ -2,6 +2,7 @@ import os, sys
 import threading
 import subprocess
 import tempfile
+import time
 from subprocess import CREATE_NO_WINDOW
 from pytubefix import YouTube
 from pytubefix.contrib.playlist import Playlist
@@ -20,8 +21,8 @@ is_downloading = False
 stop_download = False
 
 
-def is_playlist(url):  # check if yt link is playlist (refactored but same logic)
-    return "playlist?" in url
+def is_playlist(url):  # check if yt link is playlist
+    return "playlist?" in url or "/playlist" in url
 
 
 def sanitize_title(title):
@@ -71,7 +72,7 @@ def main():
     urlbox.place(x=10, y=25)
 
     def enter():
-        global is_processing, running
+        global is_processing
         if app_closed:
             return
         if is_processing:  # already working on a link
@@ -81,16 +82,30 @@ def main():
             )
             print("Already processing a download, please wait...")
             return
+
+        url = urlbox.get().strip()
+        if not url:
+            messagebox.showwarning(title="Notice", message="Please enter a video or playlist URL.")
+            return
+
         is_processing = True
 
-        url = urlbox.get()
-        try:
-            process_link(url, fileType.get())
-        except Exception as e:
-            urlbox.delete(0, END)
-            urlbox.insert(0, "Invalid URL")
-            is_processing = False
-            print(e)
+        def fetch_in_background():
+            try:
+                process_link(url, fileType.get())
+            except Exception as e:
+                def show_err(err=e):
+                    global is_processing
+                    is_processing = False
+                    print(f"Error processing URL: {err}")
+                    messagebox.showerror(
+                        title="Error",
+                        message=f"Failed to process URL: {err}"
+                    )
+                if window and window.winfo_exists():
+                    window.after(0, show_err)
+
+        threading.Thread(target=fetch_in_background, daemon=True).start()
 
     # EnterButton
     enterButton = Button(window, text="Enter", command=enter)
@@ -174,55 +189,85 @@ def reset_ui():
 
 # END OF TKINTER WINDOW CODE
 ###########################################################
+def setup_playlist_ui(pl, fileType):
+    destroy_widgets()
+    title = pl.title
+    if len(title) > 20:
+        title = title[:40] + "..."
+    global titleLabel, plDownloadCount
+    titleLabel = Label(window, text=f"Playlist Name: {title}")
+    titleLabel.pack()
+    titleLabel.place(x=10, y=50)
+    plDownloadCount = Label(window)
+    plDownloadCount.place(x=10, y=70)
+
+    def finish_selection():
+        global app_closed, is_downloading
+        if is_downloading:
+            messagebox.showinfo(
+                title="ISA ISA LANG", message="wait lang po may nagdodownload pa"
+            )
+            return
+
+        if app_closed:
+            return
+        global progress_bar, progress_label, progress_status
+        progress_status = Label(window, text="Starting download...")
+        progress_bar = ttk.Progressbar(
+            window, orient="horizontal", length=350, mode="determinate"
+        )
+        progress_label = Label(window, text="Progress: 0%")
+        download_playlist_files(pl, fileType)
+
+    global dlButton
+    dlButton = Button(
+        window, text="Download", command=finish_selection, compound=CENTER
+    )
+    dlButton.place(x=165, y=120)
+
+
 def process_link(url, fileType):
     if is_playlist(url):
         pl = Playlist(url)
-        for pl_url in pl.video_urls:
-            print(pl_url)
-        destroy_widgets()
-        title = pl.title
-        if len(title) > 20:
-            title = title[:40] + "..."
-        global titleLabel,plDownloadCount
-        titleLabel = Label(window, text=f"Playlist Name: {title}")
-        titleLabel.pack()
-        titleLabel.place(x=10, y=50)
-        plDownloadCount = Label(window)
-        plDownloadCount.place(x=10, y=70)
-        def finish_selection():
-            global app_closed, is_downloading
-            if is_downloading:
-                messagebox.showinfo(
-                    title="ISA ISA LANG", message="wait lang po may nagdodownload pa"
-                )
-                return
-
-            if app_closed:
-                return
-            global progress_bar, progress_label, progress_status
-            progress_status = Label(window, text="Starting download...")
-            progress_bar = ttk.Progressbar(
-                window, orient="horizontal", length=350, mode="determinate"
-            )
-            progress_label = Label(window, text="Progress: 0%")
-            is_downloading = True
-            download_playlist_files(pl, fileType)
-            is_downloading = False
-
-        global dlButton
-        dlButton = Button(
-            window, text="Download", command=finish_selection, compound=CENTER
-        )
-        dlButton.place(x=165, y=120)
-
+        video_urls = list(pl.video_urls)
+        if not video_urls:
+            raise ValueError("No videos found in this playlist, or the playlist is private.")
+        _ = pl.title
+        if window and window.winfo_exists():
+            window.after(0, lambda: setup_playlist_ui(pl, fileType))
     else:
-        yt = YouTube(
-            url, on_progress_callback=on_progress, on_complete_callback=on_complete
-        )
+        yt = None
+        last_error = None
+        for client in [None, "ANDROID_VR", "WEB"]:
+            try:
+                if client:
+                    candidate = YouTube(
+                        url,
+                        client=client,
+                        on_progress_callback=on_progress,
+                        on_complete_callback=on_complete,
+                    )
+                else:
+                    candidate = YouTube(
+                        url,
+                        on_progress_callback=on_progress,
+                        on_complete_callback=on_complete,
+                    )
+                _ = candidate.title
+                _ = candidate.streams
+                yt = candidate
+                break
+            except Exception as e:
+                last_error = e
+
+        if yt is None:
+            raise last_error if last_error else ValueError("Could not retrieve video streams.")
+
         print(yt.title)
         print(yt.thumbnail_url)
 
-        display_streams(yt, fileType)
+        if window and window.winfo_exists():
+            window.after(0, lambda: display_streams(yt, fileType))
 
 
 mp4_menu = None
@@ -342,6 +387,23 @@ def display_streams(obj, fileType):
             atag = stream.itag
             mp3_options[bitr] = atag
 
+        if not mp4_options:
+            for stream in obj.streams.filter(type="video"):
+                res = f"{stream.resolution} {stream.video_codec}"
+                vtag = stream.itag
+                mp4_options[res] = vtag
+
+        if not mp3_options:
+            for stream in obj.streams.filter(type="audio"):
+                bitr = f"{stream.abr}  {stream.audio_codec}"
+                atag = stream.itag
+                mp3_options[bitr] = atag
+
+        if not mp4_options or not mp3_options:
+            messagebox.showerror(title="Error", message="No compatible video/audio streams found for this video.")
+            reset_ui()
+            return
+
         chosenvidtag = StringVar()
         firstvidtag = next(iter(mp4_options.keys()))
         chosenvidtag.set(firstvidtag)
@@ -369,6 +431,17 @@ def display_streams(obj, fileType):
             bitr = f"{stream.abr}  {stream.audio_codec}"
             atag = stream.itag
             mp3_options[bitr] = atag
+
+        if not mp3_options:
+            for stream in obj.streams.filter(type="audio"):
+                bitr = f"{stream.abr}  {stream.audio_codec}"
+                atag = stream.itag
+                mp3_options[bitr] = atag
+
+        if not mp3_options:
+            messagebox.showerror(title="Error", message="No compatible audio streams found for this video.")
+            reset_ui()
+            return
 
         chosenaudtag = StringVar()
         firstaudtag = next(iter(mp3_options.keys()))
@@ -425,11 +498,6 @@ def on_complete(stream, file_path):  # when loading bar is completed
             pass
 
 
-def is_playlist(url):  # check if yt link is playlist
-    if "playlist?" in url:
-        return True
-    return False
-
 
 def ask_output_directory(title, extension=".mp4"):
     # Open file dialog to choose output path
@@ -476,39 +544,47 @@ def download_file(
     global is_downloading, progress_label, progress_bar, progress_status
     try:
         if not from_playlist:
-            progress_status.place(x=20, y=150)
+            if progress_status:
+                progress_status.place(x=20, y=150)
+            if progress_bar:
+                progress_bar.pack(pady=10)
+                progress_bar.place(x=20, y=170)
+            if progress_label:
+                progress_label.place(x=20, y=200)
 
-            progress_bar.pack(pady=10)
-            progress_bar.place(x=20, y=170)
-
-            progress_label.place(x=20, y=200)
+        ffmpeg_path = resource_path("ffmpeg.exe")
 
         if vidstream != 0:
             video_stream = yt_obj.streams.get_by_itag(vidstream)
-            progress_bar["value"] = 0
-            window.after(
-                0,
-                lambda: progress_status.config(
-                    text=f"Downloading Video of {yt_obj.title[:30]}..."
-                ),
-            )
-            video_path = video_stream.download(output_path=tempfile.gettempdir(), filename="video.mp4")
+            if progress_bar:
+                progress_bar["value"] = 0
+            if window and window.winfo_exists() and progress_status:
+                window.after(
+                    0,
+                    lambda: progress_status.config(
+                        text=f"Downloading Video of {yt_obj.title[:30]}..."
+                    ),
+                )
+            temp_vid_filename = f"jc_vid_{os.getpid()}_{int(time.time()*1000)}.tmp"
+            video_path = video_stream.download(output_path=tempfile.gettempdir(), filename=temp_vid_filename)
 
             audio_stream = yt_obj.streams.get_by_itag(audstream)
-            progress_bar["value"] = 0
-            window.after(
-                0,
-                lambda: progress_status.config(
-                    text=f"Downloading Audio of {yt_obj.title[:30]}..."
-                ),
-            )
-            audio_path = audio_stream.download(output_path=tempfile.gettempdir(), filename="audio.mp3")
+            if progress_bar:
+                progress_bar["value"] = 0
+            if window and window.winfo_exists() and progress_status:
+                window.after(
+                    0,
+                    lambda: progress_status.config(
+                        text=f"Downloading Audio of {yt_obj.title[:30]}..."
+                    ),
+                )
+            temp_aud_filename = f"jc_aud_{os.getpid()}_{int(time.time()*1000)}.tmp"
+            audio_path = audio_stream.download(output_path=tempfile.gettempdir(), filename=temp_aud_filename)
 
-            progress_label.config(
-                text=f"Combining Video and Audio file of {yt_obj.title[:15]}... pls wait..."
-            )
-
-            ffmpeg_path = os.path.join(os.path.dirname(__file__), "ffmpeg.exe")
+            if progress_label:
+                progress_label.config(
+                    text=f"Combining Video and Audio file of {yt_obj.title[:15]}... pls wait..."
+                )
 
             if os.path.exists(output_path):
                 try:
@@ -522,6 +598,7 @@ def download_file(
 
             command = [
                 ffmpeg_path,
+                "-y",
                 "-i",
                 video_path,
                 "-i",
@@ -530,30 +607,66 @@ def download_file(
                 "copy",
                 "-c:a",
                 "aac",
+                "-movflags",
+                "+faststart",
                 "-strict",
                 "experimental",
                 output_path,
             ]
             subprocess.run(command, creationflags=CREATE_NO_WINDOW)
 
-            # Optional: Clean up intermediate files
-            os.remove(video_path)
-            os.remove(audio_path)
+            if os.path.exists(video_path):
+                os.remove(video_path)
+            if os.path.exists(audio_path):
+                os.remove(audio_path)
         else:
             audio_stream = yt_obj.streams.get_by_itag(audstream)
-            progress_bar["value"] = 0
-            window.after(
-                0,
-                lambda: progress_status.config(
-                    text=f"Downloading Audio of {yt_obj.title[:30]}..."
-                ),
-            )
-            # Split full path into folder and filename
-            folder = os.path.dirname(output_path)
-            filename = os.path.basename(output_path)
+            if progress_bar:
+                progress_bar["value"] = 0
+            if window and window.winfo_exists() and progress_status:
+                window.after(
+                    0,
+                    lambda: progress_status.config(
+                        text=f"Downloading Audio of {yt_obj.title[:30]}..."
+                    ),
+                )
+            temp_aud_filename = f"jc_raw_aud_{os.getpid()}_{int(time.time()*1000)}.tmp"
+            raw_audio_path = audio_stream.download(output_path=tempfile.gettempdir(), filename=temp_aud_filename)
 
-            # Download the audio stream
-            audio_stream.download(output_path=folder, filename=filename)
+            if window and window.winfo_exists() and progress_status:
+                window.after(
+                    0,
+                    lambda: progress_status.config(
+                        text=f"Converting Audio to MP3: {yt_obj.title[:30]}..."
+                    ),
+                )
+
+            if os.path.exists(output_path):
+                try:
+                    os.remove(output_path)
+                    print(f"Deleted existing file: {output_path}")
+                except PermissionError:
+                    print(
+                        f"Cannot delete existing file (permission denied): {output_path}"
+                    )
+                    return None
+
+            command = [
+                ffmpeg_path,
+                "-y",
+                "-i",
+                raw_audio_path,
+                "-vn",
+                "-c:a",
+                "libmp3lame",
+                "-b:a",
+                "320k",
+                output_path,
+            ]
+            subprocess.run(command, creationflags=CREATE_NO_WINDOW)
+
+            if os.path.exists(raw_audio_path):
+                os.remove(raw_audio_path)
     except Exception as e:
         print(e)
 
@@ -596,11 +709,27 @@ def download_playlist_files(playlist, extension):
                         .order_by("abr")
                         .desc()
                     )
+                    best_audio = audio_stream.first()
+                    if not best_audio:
+                        best_audio = (
+                            pl_vid.streams.filter(only_audio=True)
+                            .order_by("abr")
+                            .desc()
+                            .first()
+                        )
+                    if not best_audio:
+                        print(f"No audio stream found for {url}")
+                        continue
 
                     if extension == 0:
-                        video_stream = pl_vid.streams.get_highest_resolution(
-                            progressive=False
-                        ).itag
+                        highest_res = pl_vid.streams.filter(
+                            only_video=True, mime_type="video/mp4"
+                        ).order_by("resolution").desc().first()
+                        if not highest_res:
+                            highest_res = pl_vid.streams.get_highest_resolution(
+                                progressive=False
+                            )
+                        video_stream = highest_res.itag if highest_res else 0
                     else:
                         video_stream = 0
 
@@ -633,7 +762,7 @@ def download_playlist_files(playlist, extension):
                 download_file(
                     pl_vid,
                     video_stream,
-                    audio_stream.first().itag,
+                    best_audio.itag,
                     directory,
                     from_playlist=True,
                 )
